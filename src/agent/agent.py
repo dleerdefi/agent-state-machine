@@ -130,7 +130,7 @@ class RinAgent:
             
             # Initialize orchestrator
             try:
-                await self.orchestrator.initialize(self.db)
+                await self.orchestrator.initialize(self.context_manager.db)
                 logger.info("Orchestrator initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize orchestrator: {e}")

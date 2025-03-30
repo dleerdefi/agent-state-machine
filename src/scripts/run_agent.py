@@ -177,6 +177,24 @@ async def main():
         # Get RinDB instance
         db = MongoManager.get_db()
         
+        # Verify that the db is a proper RinDB instance with the needed methods
+        if not hasattr(db, 'store_tool_item_content'):
+            logging.error("ERROR: The database instance doesn't have the required methods")
+            logging.error(f"Type of db: {type(db).__name__}")
+            logging.error("This will cause errors when processing limit orders")
+            logging.error("Attempting to re-initialize the RinDB instance")
+            
+            # Re-import and try to manually create a RinDB instance
+            from src.db.db_schema import RinDB
+            db = RinDB(MongoManager._instance)
+            await db.initialize()
+            
+            # Verify again
+            if not hasattr(db, 'store_tool_item_content'):
+                logging.error("Still failed to get a proper RinDB instance. Agent will have errors.")
+        else:
+            logging.info("Successfully verified RinDB instance with required methods")
+        
         # Ensure config has mongo_uri set
         if not config.get('mongo_uri'):
             config['mongo_uri'] = mongo_uri

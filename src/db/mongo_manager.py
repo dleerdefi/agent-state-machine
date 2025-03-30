@@ -13,6 +13,7 @@ class MongoManager:
     async def initialize(cls, mongo_uri: str, max_retries: int = 3):
         """Initialize MongoDB connection with retries"""
         if cls._instance is not None:
+            logger.info("MongoManager already initialized - returning existing instance")
             return cls._instance
 
         retry_count = 0
@@ -28,10 +29,26 @@ class MongoManager:
                 from src.db.db_schema import RinDB
                 
                 # Initialize RinDB with the client
+                logger.info("Creating RinDB instance")
                 cls._db = RinDB(cls._instance)
+                
+                # Log the type immediately after creation
+                logger.info(f"Created cls._db of type: {type(cls._db).__name__}")
+                
+                # Check if the instance has expected methods before initializing
+                if not hasattr(cls._db, 'initialize'):
+                    logger.error("ERROR: RinDB instance doesn't have 'initialize' method!")
+                    raise RuntimeError("Invalid RinDB instance created")
+                
+                if not hasattr(cls._db, 'store_tool_item_content'):
+                    logger.error("ERROR: RinDB instance doesn't have 'store_tool_item_content' method!")
+                    raise RuntimeError("Invalid RinDB instance created")
+                
                 await cls._db.initialize()
                 
                 logger.info("MongoDB connection and collections verified")
+                logger.info(f"Final cls._db type: {type(cls._db).__name__}")
+                
                 return cls._instance
                 
             except Exception as e:
@@ -47,6 +64,23 @@ class MongoManager:
         """Get database instance"""
         if cls._db is None:
             raise RuntimeError("MongoDB not initialized. Call initialize() first")
+        
+        # Add logging to help debug the type of object
+        logger.info(f"MongoManager.get_db returning object of type: {type(cls._db).__name__}")
+        
+        # Check if _db has the expected methods of a RinDB instance
+        if not hasattr(cls._db, 'store_tool_item_content'):
+            logger.error("WARNING: _db instance doesn't have expected RinDB methods!")
+            # Try to re-import RinDB and create a new instance
+            try:
+                from src.db.db_schema import RinDB
+                if isinstance(cls._instance, AsyncIOMotorClient):
+                    logger.info("Re-creating RinDB instance")
+                    cls._db = RinDB(cls._instance)
+                    logger.info(f"New _db type: {type(cls._db).__name__}")
+            except Exception as e:
+                logger.error(f"Failed to recreate RinDB instance: {e}")
+                
         return cls._db
 
     @classmethod
