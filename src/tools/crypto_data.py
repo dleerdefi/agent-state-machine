@@ -178,7 +178,19 @@ class CryptoTool(BaseTool):
         count: int = 1,
         analyzed_params: Optional[Dict] = None
     ) -> Dict:
-        """Generate crypto data content - compatible with orchestrator's calling convention"""
+        """Generate crypto data content. Returns dict with data and user response.
+           Does NOT interact with the database directly.
+        """
+        # Check if client is available
+        if not self.coingecko_client:
+            logger.error("CoinGecko client is not initialized or injected correctly.")
+            return {
+                "status": "error",
+                "error": "Crypto client not available",
+                "content_to_store": None,
+                "response": "Sorry, the crypto client isn't available."
+            }
+            
         try:
             # Use symbol from parameters or extract from topic/analyzed_params if not provided
             if not symbol:
@@ -196,70 +208,41 @@ class CryptoTool(BaseTool):
                 
             logger.info(f"Fetching crypto data for symbol: {symbol}")
                 
-            if not self.coingecko_client:
-                raise ValueError("CoinGecko client not configured")
-            
-            # Get CoinGecko ID
             coingecko_id = await self.coingecko_client._get_coingecko_id(symbol)
             if not coingecko_id:
                 raise ValueError(f"Could not find CoinGecko ID for symbol: {symbol}")
                 
-            # Gather all requested data concurrently
             tasks = [self.coingecko_client.get_token_price(coingecko_id)]
-            
             if include_details:
                 tasks.append(self.coingecko_client.get_token_details(coingecko_id))
-
             results = await asyncio.gather(*tasks)
             
-            # Process results
             data = {}
             for result in results:
-                if result:  # Only update if result is not None
-                    data.update(result)
+                if result: data.update(result)
             
-            # Create a single item for this data with a proper ObjectId
-            item_id = ObjectId()
-            
-            item = {
-                "_id": item_id,
-                "content": {
-                    "symbol": symbol,
-                    "data": data,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                },
-                "status": OperationStatus.EXECUTED.value,
-                "state": ToolOperationState.COMPLETED.value
+            content_to_store = {
+                "symbol": symbol,
+                "data": data,
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
             
-            # Store in database if we have tool_operation_id
-            if tool_operation_id and hasattr(self.db, 'store_tool_item_content'):
-                await self.db.store_tool_item_content(
-                    item_id=str(item_id),  # Convert ObjectId to string
-                    content=item.get("content", {}),
-                    operation_details={"symbol": symbol, "include_details": include_details},
-                    source='generate_content',
-                    tool_operation_id=tool_operation_id
-                )
-            
-            # Format response for immediate display
             formatted_response = self._format_crypto_response(data)
             
             return {
                 "status": "success",
                 "data": data,
-                "items": [item],
+                "content_to_store": content_to_store,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "response": formatted_response  # Add response for orchestrator
+                "response": formatted_response
             }
 
         except Exception as e:
             logger.error(f"Error fetching crypto data for {symbol}: {str(e)}")
             return {
-                "status": "error",
-                "error": str(e),
-                "items": [],
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "status": "error", "error": str(e),
+                "content_to_store": None,
+                "response": f"Sorry, error fetching crypto data for {symbol}: {e}"
             }
 
     def _format_crypto_response(self, data: Dict) -> str:

@@ -40,3 +40,8 @@ borsh-construct==0.1.0
 base58==2.1.1
 pynacl>=1.5.0
 py-near>=0.2.1  # Replacing near-api>=0.3.0 with the recommended package
+
+# Tool specific dependencies
+openmeteo_requests>=1.2.0 # For WeatherTool
+retry_requests>=1.0.1     # For WeatherTool (optional but used)
+geopy>=2.4.1              # For TimeTool (optional)

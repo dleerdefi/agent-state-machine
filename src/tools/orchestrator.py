@@ -445,31 +445,88 @@ class Orchestrator:
                         items=generation_result["items"]  # Pass the generated items
                     )
                 else:
-                    # One-shot tool - move to execution immediately
-                    logger.info(f"Executing one-shot tool operation {operation['_id']} immediately")
-
-                    # >>> ADD THIS CALL TO FINALIZE THE OPERATION <<< 
+                    # One-shot tool - handle item creation and finalization here
+                    logger.info(f"Handling one-shot tool operation {operation['_id']} immediately")
+                    
+                    # Extract content to store from the generation result
+                    content_to_store = generation_result.get("content_to_store")
+                    item_id = None # Initialize item_id
+                    
+                    if content_to_store:
+                        try:
+                            # Create the ToolItem document in the database
+                            item_id = ObjectId()
+                            tool_item_doc = {
+                                "_id": item_id,
+                                "session_id": session_id,
+                                "tool_operation_id": str(operation['_id']),
+                                "content_type": tool.registry.content_type.value,
+                                "state": ToolOperationState.COMPLETED.value, # Set final state
+                                "status": OperationStatus.EXECUTED.value,  # Set final status
+                                "content": content_to_store,
+                                "parameters": command_analysis, # Store analysis as parameters
+                                "metadata": {
+                                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                                    "tool_type": tool.registry.tool_type.value
+                                },
+                                "created_at": datetime.now(timezone.utc),
+                                "last_updated": datetime.now(timezone.utc)
+                            }
+                            insert_result = await self.db.tool_items.insert_one(tool_item_doc)
+                            item_id = str(insert_result.inserted_id) # Use the confirmed inserted ID
+                            logger.info(f"Successfully created ToolItem {item_id} for one-shot operation {operation['_id']}")
+                            
+                            # Update the operation to link the created item
+                            await self.tool_state_manager.update_operation(
+                                session_id=session_id,
+                                tool_operation_id=str(operation['_id']),
+                                output_data={
+                                    "executed_items": [item_id]
+                                },
+                                metadata={
+                                    "item_summary": {"total_items": 1, "created_item_id": item_id}
+                                }
+                            )
+                            
+                        except Exception as db_error:
+                            logger.error(f"Failed to create ToolItem for operation {operation['_id']}: {db_error}", exc_info=True)
+                            # Continue without item creation, but log the error
+                    
+                    # Finalize the operation in the ToolStateManager
                     await self.tool_state_manager.end_operation(
                         session_id=session_id,
                         tool_operation_id=str(operation['_id']),
-                        success=True,
+                        success=(generation_result.get("status") == "success"),
                         api_response=generation_result.get("data", {}), # Store raw data if available
                         step="completed"
                     )
-                    # >>> END OF ADDED CALL <<<
 
-                    # Return the result directly
+                    # Return the final response to the agent
+                    final_response = generation_result.get("response", "Operation completed.")
+                    final_status = "completed"
+                    final_state = ToolOperationState.COMPLETED.value
+                    summary_text = f"Completed {tool.name} operation successfully"
+
+                    # Handle case where tool execution failed internally
+                    if generation_result.get("status") == "error":
+                        final_status = "error"
+                        final_state = ToolOperationState.ERROR.value
+                        error_msg = generation_result.get("error", "Unknown tool error")
+                        final_response = generation_result.get("response", f"Tool failed: {error_msg}")
+                        summary_text = f"Failed {tool.name} operation: {error_msg}"
+                        logger.error(f"One-shot tool {tool.name} failed internally: {error_msg}")
+                        
                     return {
-                        "status": "completed",
-                        "state": ToolOperationState.COMPLETED.value,
+                        "status": final_status,
+                        "state": final_state,
                         "requires_chat_response": True,
-                        "response": generation_result.get("response", ""),
-                        "data": generation_result,
+                        "response": final_response, # Use response from tool
+                        "data": generation_result.get("data", {}),
                         "operation_summary": {
-                            "summary": f"Completed {tool.name} operation successfully",
+                            "summary": summary_text,
                             "operation_id": str(operation['_id']),
                             "execution_type": "immediate",
-                            "raw_data": generation_result
+                            "created_item_id": item_id # Include created item ID if available
                         }
                     }
 

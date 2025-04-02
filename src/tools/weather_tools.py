@@ -140,13 +140,26 @@ class WeatherTool(BaseTool):
             forecast_type = "current"  # Default to current weather
             units = "metric"  # Default to metric units
             
-            # Extract location using simple keyword matching
+            # Extract location using simple keyword matching and clean unnecessary words
             location_indicators = ["in", "at", "for", "weather in", "weather at", "weather for"]
             for indicator in location_indicators:
                 if indicator in command.lower():
                     parts = command.lower().split(indicator, 1)
                     if len(parts) > 1 and parts[1].strip():
-                        location = parts[1].strip()
+                        # Get the raw location and clean it
+                        raw_location = parts[1].strip()
+                        
+                        # Remove common time-related phrases that aren't part of the location
+                        time_phrases = [" right now", " today", " tomorrow", " currently", " at the moment"]
+                        cleaned_location = raw_location
+                        for phrase in time_phrases:
+                            cleaned_location = cleaned_location.replace(phrase, "")
+                            
+                        # Remove trailing punctuation and whitespace
+                        cleaned_location = cleaned_location.rstrip('?!.,;: ')
+                        
+                        if cleaned_location:
+                            location = cleaned_location.strip()
                         break
             
             # Check for forecast type
@@ -158,6 +171,8 @@ class WeatherTool(BaseTool):
             # Check for units preference
             if any(word in command.lower() for word in ["fahrenheit", "imperial", "°f"]):
                 units = "imperial"
+                
+            logger.info(f"Extracted weather location: '{location}' from command: '{command}'")
                 
             return {
                 "location": location,
@@ -182,45 +197,51 @@ class WeatherTool(BaseTool):
         schedule_id: Optional[str] = None,
         analyzed_params: Optional[Dict] = None
     ) -> Dict:
-        """Generate weather content - compatible with orchestrator's calling convention"""
+        """Generate weather content. Returns dict with data and user response.
+           Does NOT interact with the database directly.
+        """
         try:
             if analyzed_params:
                 location = analyzed_params.get("location", location)
                 units = analyzed_params.get("units", units)
                 forecast_type = analyzed_params.get("forecast_type", forecast_type)
             
-            item_id = ObjectId()
             result = await self._fetch_weather_data(location, units, forecast_type)
             
             if result.get("status") == "error":
-                return {"status": "error", "error": result.get("message", "Fetch failed"), "items": []}
+                # Return error but include necessary keys for orchestrator
+                return {
+                    "status": "error", 
+                    "error": result.get("message", "Fetch failed"), 
+                    "content_to_store": None, # Indicate no content generated
+                    "response": f"Sorry, couldn't get weather for {location}. {result.get('message', '')}"
+                 }
             
             weather_response = self._format_weather_response(result)
-            item = {
-                "_id": item_id,
-                "content": {
-                    "location": location, "units": units, "forecast_type": forecast_type,
-                    "result": result, "timestamp": datetime.now(timezone.utc).isoformat()
-                },
-                "status": OperationStatus.EXECUTED.value,
-                "state": ToolOperationState.COMPLETED.value
+            
+            # Prepare the dictionary representing the content to be stored
+            content_to_store = {
+                "location": location, 
+                "units": units, 
+                "forecast_type": forecast_type,
+                "result": result, # Contains the actual fetched data
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
             
-            if tool_operation_id and hasattr(self.db, 'store_tool_item_content'):
-                await self.db.store_tool_item_content(
-                    item_id=str(item_id), content=item.get("content", {}),
-                    operation_details={"location": location, "units": units, "forecast_type": forecast_type},
-                    source='generate_content', tool_operation_id=tool_operation_id
-                )
+            # Remove the ToolItem creation and DB call
+            # item = { ... }
+            # if tool_operation_id and hasattr(self.db, 'store_tool_item_content'): ... 
             
             return {
-                "status": "success", "data": result, "items": [item],
+                "status": "success", 
+                "data": result, # Raw data from fetch for potential use
+                "content_to_store": content_to_store, # Data for orchestrator to store
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "response": weather_response
+                "response": weather_response # User-facing formatted response
             }
         except Exception as e:
             logger.error(f"Error generating weather data: {str(e)}")
-            return {"status": "error", "error": str(e), "items": []}
+            return {"status": "error", "error": str(e), "content_to_store": None, "response": f"Error generating weather data: {e}"}
             
     async def _fetch_weather_data(
         self, 

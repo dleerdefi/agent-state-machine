@@ -22,7 +22,8 @@ from src.tools.base import (
     AgentDependencies,
     ToolRegistry
 )
-from src.clients.time_api_client import TimeApiClient
+# Defer client import to __init__
+# from src.clients.time_api_client import TimeApiClient 
 from src.services.llm_service import LLMService, ModelType
 from src.db.enums import OperationStatus, ToolOperationState, ContentType, ToolType
 from src.prompts.tool_prompts import ToolPrompts
@@ -57,19 +58,28 @@ class TimeTool(BaseTool):
         self.llm_service = None
         self.db = None
         
-        # Specific clients for this tool
+        # Specific clients for this tool - Import and instantiate here
+        self.client = None
         try:
+            from src.clients.time_api_client import TimeApiClient # Import moved here
             self.client = TimeApiClient("https://timeapi.io")
+            logger.info("TimeApiClient initialized successfully.")
+        except ImportError:
+            logger.error("Failed to import TimeApiClient. TimeTool may not function correctly.")
         except Exception as e:
             logger.error(f"Error initializing TimeApiClient: {e}")
-            self.client = None
             
         self.backup_api = "https://worldtimeapi.org/api/timezone"
         
         # Only initialize geolocator if geopy is available
         self.geolocator = None
         if has_geopy:
-            self.geolocator = Nominatim(user_agent="time_bot")
+            try:
+                self.geolocator = Nominatim(user_agent="rin_time_bot") # Use unique agent name
+                logger.info("Geopy Nominatim geolocator initialized.")
+            except Exception as e:
+                logger.error(f"Error initializing Geolocator: {e}")
+                self.geolocator = None
         
     def inject_dependencies(self, **services):
         """Inject required services - called by orchestrator during registration"""
@@ -158,7 +168,7 @@ class TimeTool(BaseTool):
         """Analyze command to extract location/timezone and action"""
         try:
             action = "get_time"  # Default action
-            timezone = "America/New_York"  # Default timezone
+            target_timezone = "America/New_York"  # Default timezone (renamed from timezone)
             source_timezone = None
             source_time = None
             
@@ -167,21 +177,17 @@ class TimeTool(BaseTool):
             if any(indicator in command.lower() for indicator in conversion_indicators):
                 action = "convert_time"
                 
-                # Simple regex-based extraction - in production, use LLM or more robust parsing
+                # Simple regex-based extraction
                 import re
-                
-                # Try to extract "from X to Y" pattern
-                from_to_match = re.search(r'from\s+([a-zA-Z\s]+)\s+to\s+([a-zA-Z\s]+)', command)
+                from_to_match = re.search(r'from\s+([a-zA-Z\s/_-]+)\s+to\s+([a-zA-Z\s/_-]+)', command, re.IGNORECASE)
                 if from_to_match:
                     source_timezone = from_to_match.group(1).strip()
-                    timezone = from_to_match.group(2).strip()
+                    target_timezone = from_to_match.group(2).strip() # Renamed
                 
-                # Try to extract time if present
                 time_match = re.search(r'(\d{1,2}:\d{2}(?:\s*[ap]m)?)', command, re.IGNORECASE)
                 if time_match:
                     source_time = time_match.group(1)
                 else:
-                    # Default to current time
                     source_time = datetime.now().strftime("%H:%M")
             else:
                 # Get timezone from location in command
@@ -190,15 +196,15 @@ class TimeTool(BaseTool):
                     if indicator in command.lower():
                         parts = command.lower().split(indicator, 1)
                         if len(parts) > 1 and parts[1].strip():
-                            timezone = parts[1].strip()
+                            target_timezone = parts[1].strip() # Renamed
                             break
             
             return {
                 "action": action,
-                "timezone": timezone,
+                "timezone": target_timezone, # Keep 'timezone' key for compatibility if needed externally
                 "source_timezone": source_timezone,
                 "source_time": source_time,
-                "item_count": 1  # Always 1 for this tool
+                "item_count": 1 
             }
             
         except Exception as e:
@@ -207,109 +213,127 @@ class TimeTool(BaseTool):
 
     async def _generate_content(
         self, 
-        timezone: str = "America/New_York",
+        timezone: str = "America/New_York", # Keep param name for external consistency
         action: str = "get_time",
         source_timezone: Optional[str] = None,
         source_time: Optional[str] = None,
         tool_operation_id: Optional[str] = None,
-        # Add parameters to match orchestrator's calling convention
         topic: Optional[str] = None,
         count: int = 1,
         revision_instructions: Optional[str] = None,
         schedule_id: Optional[str] = None,
         analyzed_params: Optional[Dict] = None
     ) -> Dict:
-        """Generate time content - compatible with orchestrator's calling convention"""
+        """Generate time content. Returns dict with data and user response.
+           Does NOT interact with the database directly.
+        """
+        # Use a different variable name internally to avoid shadowing datetime.timezone
+        target_tz_str = timezone 
+        source_tz_str = source_timezone
         try:
             # Use analyzed_params if available
             if analyzed_params:
                 action = analyzed_params.get("action", action)
-                timezone = analyzed_params.get("timezone", timezone)
-                source_timezone = analyzed_params.get("source_timezone", source_timezone)
+                target_tz_str = analyzed_params.get("timezone", target_tz_str) # Update internal var
+                source_tz_str = analyzed_params.get("source_timezone", source_tz_str) # Update internal var
                 source_time = analyzed_params.get("source_time", source_time)
             
-            # Generate a proper ObjectId for MongoDB
-            item_id = ObjectId()
-            
+            # First resolve timezone - add early error handling
+            resolved_timezone = await self._resolve_timezone(target_tz_str)
+            if not resolved_timezone:
+                return {
+                    "status": "error",
+                    "error": f"Could not determine timezone for: {target_tz_str}",
+                    "content_to_store": None,
+                    "response": f"Sorry, I couldn't determine the timezone for: {target_tz_str}",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                
+            # Now proceed with the resolved timezone
             result = None
             if action == "get_time":
-                result = await self.get_current_time_in_zone(timezone)
+                result = await self.get_current_time_in_zone(target_tz_str) # Use internal var
             elif action == "convert_time":
-                if source_timezone and source_time:
+                # Also check source timezone resolution for conversion
+                resolved_source_tz = await self._resolve_timezone(source_tz_str) if source_tz_str else None
+                if source_tz_str and not resolved_source_tz:
+                    return {
+                        "status": "error",
+                        "error": f"Could not determine source timezone: {source_tz_str}",
+                        "content_to_store": None,
+                        "response": f"Sorry, I couldn't determine the source timezone: {source_tz_str}",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                
+                if source_tz_str and source_time:
                     result = await self.convert_time_between_zones(
-                        from_zone=source_timezone,
+                        from_zone=source_tz_str, # Use internal var
                         date_time=source_time,
-                        to_zone=timezone
+                        to_zone=target_tz_str # Use internal var
                     )
                 else:
                     return {
                         "status": "error",
                         "error": "Missing source timezone or time for conversion",
-                        "items": []
+                        "content_to_store": None,
+                        "response": "I need both a source timezone and a time to convert!",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
                     }
             else:
-                return {
-                    "status": "error",
-                    "error": f"Unknown action: {action}",
-                    "items": []
+                 return {
+                    "status": "error", 
+                    "error": f"Unknown action: {action}", 
+                    "content_to_store": None,
+                    "response": f"Sorry, I don't know how to handle the time action: {action}",
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 }
+            
+            # Handle potential errors from helper methods
+            if result.get("status") == "error":
+                 return {
+                    "status": "error", 
+                    "error": result.get("response", "Failed to process time request"), 
+                    "content_to_store": None,
+                    "response": result.get("response", "Sorry, I couldn't process that time request."),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                 }
             
             # Format response for immediate display
             time_response = self._format_time_response(result)
             
-            # Create a single item for this data
-            item = {
-                "_id": item_id,
-                "content": {
-                    "action": action,
-                    "timezone": timezone,
-                    "source_timezone": source_timezone,
-                    "source_time": source_time,
-                    "result": result,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                },
-                "status": OperationStatus.EXECUTED.value,
-                "state": ToolOperationState.COMPLETED.value
+            # Prepare the dictionary representing the content to be stored
+            content_to_store = {
+                "action": action,
+                "timezone": target_tz_str, # Store the actual timezone string used
+                "source_timezone": source_tz_str,
+                "source_time": source_time,
+                "result": result, # Contains the actual fetched data
+                "timestamp": datetime.now(timezone.utc).isoformat() # Now timezone.utc works!
             }
-            
-            # Store in database if we have tool_operation_id
-            if tool_operation_id and hasattr(self.db, 'store_tool_item_content'):
-                await self.db.store_tool_item_content(
-                    item_id=str(item_id),  # Convert ObjectId to string
-                    content=item.get("content", {}),
-                    operation_details={
-                        "action": action,
-                        "timezone": timezone,
-                        "source_timezone": source_timezone,
-                        "source_time": source_time
-                    },
-                    source='generate_content',
-                    tool_operation_id=tool_operation_id
-                )
             
             return {
                 "status": "success",
-                "data": result,
-                "items": [item],
+                "data": result, # Raw data from fetch
+                "content_to_store": content_to_store, # Data for orchestrator to store
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "response": time_response  # Add response for orchestrator
+                "response": time_response  # User-facing formatted response
             }
 
         except Exception as e:
-            logger.error(f"Error generating time data: {str(e)}")
+            logger.error(f"Error generating time data: {str(e)}", exc_info=True) # Added exc_info
             return {
-                "status": "error",
-                "error": str(e),
-                "items": [],
+                "status": "error", "error": str(e),
+                "content_to_store": None,
+                "response": f"Sorry, an unexpected error occurred while handling time: {e}",
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
 
     async def get_current_time_in_zone(self, location_or_timezone: str) -> Dict:
         """Get current time for a location or timezone"""
         try:
-            # Try to get timezone from location if not a timezone string
-            timezone = await self._resolve_timezone(location_or_timezone)
-            if not timezone:
+            # Use tz_str internally
+            tz_str = await self._resolve_timezone(location_or_timezone)
+            if not tz_str:
                 return {
                     "status": "error",
                     "response": f"Could not determine timezone for: {location_or_timezone}",
@@ -317,8 +341,8 @@ class TimeTool(BaseTool):
                     "timestamp": datetime.utcnow().isoformat()
                 }
 
-            # Fetch time data
-            data = await self._fetch_time_data(timezone)
+            # Fetch time data using the resolved string
+            data = await self._fetch_time_data(tz_str)
             
             if not data:
                 return {
@@ -330,8 +354,8 @@ class TimeTool(BaseTool):
 
             result = {
                 "status": "success",
-                "location": location_or_timezone,
-                "timezone": timezone,
+                "location": location_or_timezone, # Original user input
+                "timezone": tz_str, # Resolved timezone string
                 "current_time": self._format_time(data.get("dateTime")),
                 "day_of_week": data.get("dayOfWeek"),
                 "dst_active": data.get("dstActive")

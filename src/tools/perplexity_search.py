@@ -155,87 +155,84 @@ class PerplexityTool(BaseTool):
         query: str = None,
         max_tokens: int = 300,
         tool_operation_id: Optional[str] = None,
-        # Add parameters to match orchestrator's calling convention
         topic: Optional[str] = None,
         count: int = 1,
         revision_instructions: Optional[str] = None,
         schedule_id: Optional[str] = None,
         analyzed_params: Optional[Dict] = None
     ) -> Dict:
-        """Generate search content - compatible with orchestrator's calling convention"""
+        """Generate search content. Aligns with perplexity_client return structure.
+           Does NOT interact with the database directly.
+        """
+        if not self.perplexity_client:
+            logger.error("Perplexity client is not initialized or injected correctly.")
+            return {
+                "status": "error", "error": "Search client not available",
+                "content_to_store": None, "response": "Sorry, the search client isn't available.",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        
         try:
-            # Use query from parameters or extract from topic/analyzed_params if not provided
             if not query:
-                if analyzed_params and "query" in analyzed_params:
-                    query = analyzed_params["query"]
-                elif topic:
-                    query = topic
-                    
-            if not query:
-                raise ValueError("No search query provided")
+                if analyzed_params and "query" in analyzed_params: query = analyzed_params["query"]
+                elif topic: query = topic
+            if not query: raise ValueError("No search query provided")
                 
-            if not self.perplexity_client:
-                raise ValueError("Perplexity client not configured")
-                
-            # Log the search query
             logger.info(f"Performing search for query: {query}")
-                
-            # Perform search
-            result = await self.perplexity_client.search(query, max_tokens)
-            
-            # Create a single item for this search result with a proper ObjectId
-            item_id = ObjectId()
-            
-            item = {
-                "_id": item_id,
-                "content": {
-                    "query": query,
-                    "answer": result.get("answer", ""),
-                    "sources": result.get("sources", []),
+            client_result = await self.perplexity_client.search(query, max_tokens)
+
+            # Check the status returned by the client
+            if client_result.get("status") != "success":
+                error_msg = client_result.get("error", "Unknown client error")
+                logger.error(f"Perplexity client failed: {error_msg}")
+                return {
+                    "status": "error", "error": error_msg,
+                    "content_to_store": None,
+                    "response": f"Sorry, the search failed: {error_msg}",
                     "timestamp": datetime.now(timezone.utc).isoformat()
-                },
-                "status": OperationStatus.EXECUTED.value,
-                "state": ToolOperationState.COMPLETED.value
+                }
+
+            # Extract the raw answer string from the client's 'data' field
+            # The client returns {"status": "success", "data": "answer string"}
+            answer_string = client_result.get("data", "")
+            if not answer_string:
+                 logger.warning(f"Perplexity client returned success but no answer data for query: {query}")
+                 answer_string = "No specific answer found."
+
+            # Prepare content for database storage
+            content_to_store = {
+                "query": query,
+                "answer": answer_string, # Store the raw answer string
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
             
-            # Store in database if we have tool_operation_id
-            if tool_operation_id and hasattr(self.db, 'store_tool_item_content'):
-                await self.db.store_tool_item_content(
-                    item_id=str(item_id),  # Convert ObjectId to string
-                    content=item.get("content", {}),
-                    operation_details={"query": query, "max_tokens": max_tokens},
-                    source='generate_content',
-                    tool_operation_id=tool_operation_id
-                )
+            # User-facing response is the answer string itself
+            search_response = answer_string 
             
-            # Format response with sources for immediate display
-            search_response = result.get("answer", "No results found.")
-            sources = result.get("sources", [])
-            
-            if sources:
-                source_text = "\n\nSources:\n" + "\n".join([
-                    f"- {s.get('title', 'Untitled')} ({s.get('url', 'No URL')})"
-                    for s in sources[:3]  # Limit to first 3 sources
-                ])
-                search_response += source_text
+            # Create items array for orchestrator expected structure
+            items = [{
+                "_id": str(ObjectId()),
+                "content": content_to_store,
+                "metadata": {
+                    "generated_at": datetime.now(timezone.utc).isoformat()
+                }
+            }]
             
             return {
                 "status": "success",
-                "data": {
-                    "answer": result.get("answer", ""),
-                    "sources": result.get("sources", [])
-                },
-                "items": [item],
+                "data": {"answer": answer_string},
+                "content_to_store": content_to_store, 
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "response": search_response  # Add response for orchestrator
+                "response": search_response,
+                "items": items
             }
 
         except Exception as e:
-            logger.error(f"Error in perplexity search: {e}", exc_info=True)
+            logger.error(f"Error in perplexity search _generate_content: {e}", exc_info=True)
             return {
-                "status": "error",
-                "error": str(e),
-                "items": [],
+                "status": "error", "error": str(e),
+                "content_to_store": None,
+                "response": f"Sorry, an error occurred during the search: {e}",
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
 

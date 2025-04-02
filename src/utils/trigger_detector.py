@@ -67,24 +67,22 @@ class TriggerDetector:
             }
         }
         
-        # Crypto Tool Triggers
-        self.tool_triggers['crypto'] = {
+        # Use ToolType enum values as keys for consistency
+        self.tool_triggers[ToolType.CRYPTO_DATA.value] = {
             'keywords': [
                 'bitcoin', 'btc', 'eth', 'solana', 'near', 'dogecoin', 'fartcoin', 'sui', 'ethereum', 'price', 'market', 'crypto', '$', 'coin',
                 'token', 'altcoin', 'nft', 'blockchain', 'gas fee', 'wallet', 'swap', 'defi'
             ],
-
             'phrases': [
                 'how much is', "what's the price", 'show me the market', 'crypto trends',
             ]
         }
         
-        # Web Search with Reasoning Tool Triggers
-        self.tool_triggers['search'] = {
+        self.tool_triggers[ToolType.SEARCH.value] = {
             'keywords': [
                 'news', 'latest', 'current', 'today', 'happened', 'recent', 'headline',
                 'stocks', 'finance', 'updates', 'economy', 'elections', 'company', 'ceo',
-                'IPO', 'merger', 'lawsuit', 'AI developments'
+                'IPO', 'merger', 'lawsuit', 'AI developments', 'search for', 'find info on', 'what is', 'tell me about'
             ],
             'phrases': [
                 'what is happening', 'tell me about', 'what happened', 'search for',
@@ -101,8 +99,8 @@ class TriggerDetector:
             ]
         }
 
-        # Time Tool Triggers
-        self.tool_triggers['time'] = {
+        # Use ToolType enum values as keys for consistency
+        self.tool_triggers[ToolType.TIME.value] = {
             'keywords': [
                 'time', 'clock', 'timezone', 'tz', 'hour', 'date', 'schedule',
                 'convert time', 'what time', 'current time'
@@ -113,8 +111,7 @@ class TriggerDetector:
             ]
         }
 
-        # Weather Tool Triggers
-        self.tool_triggers['weather'] = {
+        self.tool_triggers[ToolType.WEATHER.value] = {
             'keywords': [
                 'weather', 'temperature', 'forecast', 'rain', 'snow', 'humidity',
                 'wind', 'precipitation', 'sunny', 'cloudy'
@@ -125,8 +122,7 @@ class TriggerDetector:
             ]
         }
 
-        # Calendar Tool Triggers
-        self.tool_triggers['calendar'] = {
+        self.tool_triggers[ToolType.CALENDAR.value] = {
             'keywords': [
                 'calendar', 'schedule', 'event', 'appointment', 'meeting',
                 'agenda', 'upcoming', 'planned', 'booked', 'reminder'
@@ -139,8 +135,7 @@ class TriggerDetector:
             ]
         }
 
-        # Add specific Limit Order Tool Triggers
-        self.tool_triggers['intents'] = {
+        self.tool_triggers[ToolType.INTENTS.value] = {
             'keywords': [
                 'limit order', 'buy when', 'sell when', 'price reaches',
                 'target price', 'execute when', 'trigger price', 'when price hits',
@@ -160,11 +155,11 @@ class TriggerDetector:
         """Check if message should trigger tool usage"""
         message = message.lower()
         
-        for tool in self.tool_triggers.values():
+        for tool_key in self.tool_triggers:
+            tool = self.tool_triggers[tool_key]
             # Check keywords
             if any(keyword.lower() in message for keyword in tool['keywords']):
                 return True
-                
             # Check phrases
             if any(phrase.lower() in message for phrase in tool['phrases']):
                 return True
@@ -178,7 +173,6 @@ class TriggerDetector:
         # Check memory keywords
         if any(keyword.lower() in message for keyword in self.memory_triggers['keywords']):
             return True
-            
         # Check memory phrases
         if any(phrase.lower() in message for phrase in self.memory_triggers['phrases']):
             return True
@@ -238,40 +232,51 @@ class TriggerDetector:
         return "send_tweet"
 
     def get_specific_tool_type(self, message: str) -> Optional[str]:
-        """Determine specific tool type needed"""
+        """Determine specific tool type needed, prioritizing more specific triggers."""
         message = message.lower()
         
-        # Check for limit order patterns FIRST (most specific)
-        if any(keyword.lower() in message for keyword in self.tool_triggers['intents']['keywords']) or \
-           any(phrase.lower() in message for phrase in self.tool_triggers['intents']['phrases']):
-            return ToolType.INTENTS.value  # Return proper enum value
-        
-        # Check Twitter patterns AFTER intents
+        # Prioritized Checks (Most specific first)
+        # 1. Intents (Limit Orders)
+        intents_key = ToolType.INTENTS.value
+        if intents_key in self.tool_triggers and (any(keyword.lower() in message for keyword in self.tool_triggers[intents_key]['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers[intents_key]['phrases'])):
+            return intents_key
+            
+        # 2. Twitter (Complex internal logic)
         if self.should_use_twitter(message):
-            return ToolType.TWITTER.value  # Return proper enum value
-        
-        # Rest of the tool checks with proper enum values
-        if any(keyword.lower() in message for keyword in self.tool_triggers['time']['keywords']) or \
-           any(phrase.lower() in message for phrase in self.tool_triggers['time']['phrases']):
-            return ToolType.TIME.value
-        
-        if any(keyword.lower() in message for keyword in self.tool_triggers['weather']['keywords']) or \
-           any(phrase.lower() in message for phrase in self.tool_triggers['weather']['phrases']):
-            return ToolType.WEATHER.value
-        
-        # Check crypto triggers
-        if any(keyword.lower() in message for keyword in self.tool_triggers['crypto']['keywords']) or \
-           any(phrase.lower() in message for phrase in self.tool_triggers['crypto']['phrases']):
-            return ToolType.CRYPTO.value
-        
-        # Check search triggers
-        if any(keyword.lower() in message for keyword in self.tool_triggers['search']['keywords']) or \
-           any(phrase.lower() in message for phrase in self.tool_triggers['search']['phrases']):
-            return ToolType.SEARCH.value
-        
-        # Add calendar check
-        if any(keyword.lower() in message for keyword in self.tool_triggers['calendar']['keywords']) or \
-           any(phrase.lower() in message for phrase in self.tool_triggers['calendar']['phrases']):
-            return ToolType.CALENDAR.value
-        
-        return None 
+            return ToolType.TWITTER.value
+            
+        # 3. Weather
+        weather_key = ToolType.WEATHER.value
+        if weather_key in self.tool_triggers and (any(keyword.lower() in message for keyword in self.tool_triggers[weather_key]['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers[weather_key]['phrases'])):
+            return weather_key
+            
+        # 4. Time
+        time_key = ToolType.TIME.value
+        if time_key in self.tool_triggers and (any(keyword.lower() in message for keyword in self.tool_triggers[time_key]['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers[time_key]['phrases'])):
+            return time_key
+            
+        # 5. Crypto Data
+        crypto_key = ToolType.CRYPTO_DATA.value
+        if crypto_key in self.tool_triggers and (any(keyword.lower() in message for keyword in self.tool_triggers[crypto_key]['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers[crypto_key]['phrases'])):
+            return crypto_key
+            
+        # 6. Calendar
+        calendar_key = ToolType.CALENDAR.value
+        if calendar_key in self.tool_triggers and (any(keyword.lower() in message for keyword in self.tool_triggers[calendar_key]['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers[calendar_key]['phrases'])):
+            return calendar_key
+
+        # General Checks (Less specific, checked last)
+        # 7. Search (General web search)
+        search_key = ToolType.SEARCH.value
+        if search_key in self.tool_triggers and (any(keyword.lower() in message for keyword in self.tool_triggers[search_key]['keywords']) or \
+           any(phrase.lower() in message for phrase in self.tool_triggers[search_key]['phrases'])):
+            return search_key
+            
+        # Add checks for any other tools here if necessary
+            
+        return None # No specific tool detected 
