@@ -1,90 +1,214 @@
 # must be updated to use new tool structure
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import asyncio
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
+import json
+from bson import ObjectId
 
-from src.tools.base import BaseTool, AgentResult
+from src.tools.base import (
+    BaseTool,
+    AgentResult,
+    AgentDependencies,
+    ToolRegistry
+)
 from src.clients.coingecko_client import CoinGeckoClient
+from src.db.enums import OperationStatus, ToolOperationState, ContentType, ToolType
+from src.utils.json_parser import parse_strict_json
 
 logger = logging.getLogger(__name__)
 
 class CryptoTool(BaseTool):
-    name = "crypto_data"
-    description = "Cryptocurrency price and market data tool"
+    """Cryptocurrency price and market data tool"""
+    
+    # Static tool configuration
+    name = "crypto_data"  # Match the ToolType.CRYPTO_DATA value exactly
+    description = "Get cryptocurrency price and market data"
     version = "1.0.0"
     
-    def __init__(self, coingecko_client: Optional[CoinGeckoClient]):
+    # Tool registry configuration - optimized for one-shot usage
+    registry = ToolRegistry(
+        content_type=ContentType.CRYPTO_DATA,
+        tool_type=ToolType.CRYPTO_DATA,
+        requires_approval=False,  # No approval needed
+        requires_scheduling=False,  # No scheduling needed
+        required_clients=["coingecko_client"],
+        required_managers=["tool_state_manager"]
+    )
+    
+    def __init__(self, deps: Optional[AgentDependencies] = None):
+        """Initialize crypto tool with dependencies"""
         super().__init__()
-        self.coingecko = coingecko_client
+        self.deps = deps or AgentDependencies()
         
-    async def initialize(self):
-        """Initialize the CoinGecko client's async session"""
-        if self.coingecko:
-            self.coingecko = await self.coingecko.__aenter__()
-            
-    async def cleanup(self):
-        """Cleanup the CoinGecko client's async session"""
-        if self.coingecko:
-            await self.coingecko.__aexit__(None, None, None)
+        # Services will be injected by orchestrator based on registry requirements
+        self.tool_state_manager = None
+        self.coingecko_client = None
+        self.db = None
 
-    async def run(self, input_data: Any) -> Dict[str, Any]:
-        """Main execution method"""
-        return await self._get_crypto_data(input_data)
-
-    def can_handle(self, input_data: Any) -> bool:
-        """Delegate to TriggerDetector"""
-        return isinstance(input_data, str)  # Basic type check only
-
-    async def execute(self, command: str) -> Dict:
-        """Execute crypto data command"""
+    def inject_dependencies(self, **services):
+        """Inject required services - called by orchestrator during registration"""
+        self.tool_state_manager = services.get("tool_state_manager")
+        self.coingecko_client = services.get("coingecko_client")
+        self.db = self.tool_state_manager.db if self.tool_state_manager else None
+    
+    async def run(self, input_data: str) -> Dict:
+        """Run the crypto tool - optimized for one-shot use without approval flow"""
         try:
-            if not self.coingecko:
-                return {
-                    "status": "error",
-                    "error": "CoinGecko client not configured",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
+            # Get or create operation
+            operation = await self.tool_state_manager.get_operation(self.deps.session_id)
+            if not operation:
+                # Create a new operation in COLLECTING state
+                operation = await self.tool_state_manager.start_operation(
+                    session_id=self.deps.session_id,
+                    tool_type=self.registry.tool_type.value,
+                    initial_data={"command": input_data},
+                    initial_state=ToolOperationState.COLLECTING.value
+                )
             
-            # Extract symbol from command
-            words = command.lower().split()
-            for word in words:
-                if word in self.coingecko.SYMBOL_TO_COINGECKO:
-                    symbol = word.upper()
-                    break
-            else:
-                symbol = 'BTC'  # Default to Bitcoin if no clear symbol found
-                
-            return await self._get_crypto_data(
-                symbol=symbol,
-                include_details=True
+            # Analyze command to extract token symbol
+            command_analysis = await self._analyze_command(input_data)
+            logger.info(f"Crypto tool analysis: {command_analysis}")
+            
+            # Generate content (fetch data)
+            content_result = await self._generate_content(
+                symbol=command_analysis.get("symbol", "BTC"),
+                include_details=command_analysis.get("include_details", True),
+                tool_operation_id=str(operation["_id"]),
+                topic=input_data,
+                count=1,
+                analyzed_params=command_analysis
             )
             
+            # Update operation with content result
+            await self.tool_state_manager.update_operation(
+                session_id=self.deps.session_id,
+                tool_operation_id=str(operation["_id"]),
+                input_data={
+                    "command": input_data,
+                    "command_info": command_analysis
+                },
+                content_updates={
+                    "items": content_result.get("items", [])
+                }
+            )
+            
+            # Move directly to COMPLETED state for one-shot tools
+            await self.tool_state_manager.update_operation(
+                session_id=self.deps.session_id,
+                tool_operation_id=str(operation["_id"]),
+                state=ToolOperationState.COMPLETED.value
+            )
+            
+            # End operation with success
+            await self.tool_state_manager.end_operation(
+                session_id=self.deps.session_id,
+                tool_operation_id=str(operation["_id"]),
+                success=True,
+                api_response=content_result
+            )
+            
+            # Get the formatted response from content_result
+            formatted_response = content_result.get("response", "No cryptocurrency data available.")
+            
+            return {
+                "status": "completed",
+                "state": ToolOperationState.COMPLETED.value,
+                "response": formatted_response,
+                "requires_chat_response": True,
+                "data": content_result.get("data", {})
+            }
+            
         except Exception as e:
-            logger.error(f"Error executing crypto command: {e}")
+            logger.error(f"Error in crypto tool: {e}", exc_info=True)
             return {
                 "status": "error",
                 "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                "response": f"Sorry, I couldn't retrieve cryptocurrency data: {str(e)}",
+                "requires_chat_response": True
             }
 
-    async def _get_crypto_data(self, symbol: str, include_details: bool = False) -> Dict:
-        """Get cryptocurrency data with proper session handling"""
+    async def _analyze_command(self, command: str) -> Dict:
+        """Analyze command to extract token symbol and parameters"""
         try:
-            # Get CoinGecko ID
-            coingecko_id = await self.coingecko._get_coingecko_id(symbol)
-            if not coingecko_id:
-                return {
-                    "status": "error",
-                    "error": f"Could not find CoinGecko ID for symbol: {symbol}",
-                    "timestamp": datetime.utcnow().isoformat()
-                }
+            # Extract token symbol from command
+            symbol = "BTC"  # Default to Bitcoin
+            include_details = True
+            
+            # Simple keyword matching for token symbols
+            common_tokens = {
+                "btc": "BTC", "bitcoin": "BTC",
+                "eth": "ETH", "ethereum": "ETH",
+                "sol": "SOL", "solana": "SOL",
+                "near": "NEAR",
+                "usdc": "USDC", "usdt": "USDT",
+                "doge": "DOGE", "dogecoin": "DOGE",
+                "xrp": "XRP", "ripple": "XRP",
+                "ada": "ADA", "cardano": "ADA"
+            }
+            
+            # Check for token names in command
+            words = command.lower().split()
+            for word in words:
+                if word in common_tokens:
+                    symbol = common_tokens[word]
+                    break
+            
+            # Check for more detailed analysis request
+            include_details = any(word in command.lower() for word in 
+                              ["detail", "market", "info", "data", "volume", "cap"])
+            
+            return {
+                "symbol": symbol,
+                "include_details": include_details,
+                "item_count": 1  # Always 1 for this tool
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing crypto command: {e}")
+            return {"symbol": "BTC", "include_details": True, "item_count": 1}
 
+    async def _generate_content(
+        self, 
+        symbol: str = None,
+        include_details: bool = True,
+        tool_operation_id: Optional[str] = None,
+        # Add parameters to match orchestrator's calling convention
+        topic: Optional[str] = None,
+        count: int = 1,
+        analyzed_params: Optional[Dict] = None
+    ) -> Dict:
+        """Generate crypto data content - compatible with orchestrator's calling convention"""
+        try:
+            # Use symbol from parameters or extract from topic/analyzed_params if not provided
+            if not symbol:
+                if analyzed_params and "symbol" in analyzed_params:
+                    symbol = analyzed_params["symbol"]
+                elif topic:
+                    # Try to extract symbol from topic
+                    for common_token in ["BTC", "ETH", "SOL", "NEAR", "USDC", "USDT", "DOGE", "XRP", "ADA"]:
+                        if common_token in topic.upper():
+                            symbol = common_token
+                            break
+                
+            if not symbol:
+                symbol = "BTC"  # Default to Bitcoin if no symbol is found
+                
+            logger.info(f"Fetching crypto data for symbol: {symbol}")
+                
+            if not self.coingecko_client:
+                raise ValueError("CoinGecko client not configured")
+            
+            # Get CoinGecko ID
+            coingecko_id = await self.coingecko_client._get_coingecko_id(symbol)
+            if not coingecko_id:
+                raise ValueError(f"Could not find CoinGecko ID for symbol: {symbol}")
+                
             # Gather all requested data concurrently
-            tasks = [self.coingecko.get_token_price(coingecko_id)]
+            tasks = [self.coingecko_client.get_token_price(coingecko_id)]
             
             if include_details:
-                tasks.append(self.coingecko.get_token_details(coingecko_id))
+                tasks.append(self.coingecko_client.get_token_details(coingecko_id))
 
             results = await asyncio.gather(*tasks)
             
@@ -93,11 +217,40 @@ class CryptoTool(BaseTool):
             for result in results:
                 if result:  # Only update if result is not None
                     data.update(result)
-
+            
+            # Create a single item for this data with a proper ObjectId
+            item_id = ObjectId()
+            
+            item = {
+                "_id": item_id,
+                "content": {
+                    "symbol": symbol,
+                    "data": data,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                },
+                "status": OperationStatus.EXECUTED.value,
+                "state": ToolOperationState.COMPLETED.value
+            }
+            
+            # Store in database if we have tool_operation_id
+            if tool_operation_id and hasattr(self.db, 'store_tool_item_content'):
+                await self.db.store_tool_item_content(
+                    item_id=str(item_id),  # Convert ObjectId to string
+                    content=item.get("content", {}),
+                    operation_details={"symbol": symbol, "include_details": include_details},
+                    source='generate_content',
+                    tool_operation_id=tool_operation_id
+                )
+            
+            # Format response for immediate display
+            formatted_response = self._format_crypto_response(data)
+            
             return {
                 "status": "success",
                 "data": data,
-                "timestamp": datetime.utcnow().isoformat()
+                "items": [item],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "response": formatted_response  # Add response for orchestrator
             }
 
         except Exception as e:
@@ -105,48 +258,12 @@ class CryptoTool(BaseTool):
             return {
                 "status": "error",
                 "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-    async def _get_crypto_market_data(self, symbol: str, include_social: bool = True) -> Dict:
-        """Get detailed cryptocurrency market data including social metrics"""
-        try:
-            coingecko_id = await self.coingecko._get_coingecko_id(symbol)
-            if not coingecko_id:
-                return {
-                    "status": "error",
-                    "error": f"Could not find CoinGecko ID for symbol: {symbol}"
-                }
-            
-            details = await self.coingecko.get_token_details(coingecko_id)
-            if not details:
-                return {
-                    "status": "error",
-                    "error": f"Could not fetch market data for {symbol}"
-                }
-            
-            # Filter social metrics if not requested
-            if not include_social:
-                details = {k: v for k, v in details.items() 
-                          if not k in ['twitter_followers', 'reddit_subscribers', 
-                                     'telegram_channel_user_count']}
-            
-            return {
-                "status": "success",
-                "data": details,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching market data for {symbol}: {str(e)}")
-            return {
-                "status": "error",
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
+                "items": [],
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
 
     def _format_crypto_response(self, data: Dict) -> str:
-        """Format cryptocurrency data for Rin agent consumption"""
+        """Format cryptocurrency data for user consumption"""
         try:
             response_parts = []
             
@@ -204,3 +321,12 @@ class CryptoTool(BaseTool):
         except Exception as e:
             logger.error(f"Error formatting crypto response: {e}")
             return str(data)  # Fallback to basic string representation
+
+    def can_handle(self, command_text: str, tool_type: Optional[str] = None) -> bool:
+        """Check if this tool can handle the given command"""
+        # If tool_type is explicitly specified as 'crypto_data', handle it
+        if tool_type and tool_type.lower() == self.registry.tool_type.value.lower():
+            return True
+        
+        # Otherwise, don't try to detect keywords here - that's the trigger detector's job
+        return False

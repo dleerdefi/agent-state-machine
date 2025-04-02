@@ -41,7 +41,7 @@ from src.services.monitoring_service import LimitOrderMonitoringService
 from src.managers.tool_state_manager import ToolStateManager, ToolOperationState
 from src.db.mongo_manager import MongoManager
 from src.managers.schedule_manager import ScheduleManager
-from src.managers.approval_manager import ApprovalManager, ApprovalAction
+from src.managers.approval_manager import ApprovalManager, ApprovalAction, ApprovalState
 
 # Utility imports
 from src.utils.trigger_detector import TriggerDetector
@@ -88,9 +88,14 @@ class Orchestrator:
             db = MongoManager.get_db()
             if not db:
                 raise ValueError("Failed to initialize MongoDB")
+        
+        # Check if db is a proper RinDB instance with store_tool_item_content method
+        if not hasattr(db, 'store_tool_item_content'):
+            logger.warning("MongoDB instance does not have store_tool_item_content method")
             
         # Store db instance
         self.db = db
+        logger.info(f"Orchestrator using db of type: {type(self.db).__name__}")
         
         # Initialize managers in correct order
         self.tool_state_manager = ToolStateManager(db=db)
@@ -113,6 +118,9 @@ class Orchestrator:
         # Initialize CoinGecko client for price monitoring
         self.coingecko_client = CoinGeckoClient(api_key=os.getenv('COINGECKO_API_KEY'))
         
+        # Initialize Perplexity client for search
+        self.perplexity_client = PerplexityClient(api_key=os.getenv('PERPLEXITY_API_KEY'))
+        
         # Initialize NEAR account
         self.near_account = get_near_account()
         if not self.near_account:
@@ -123,6 +131,10 @@ class Orchestrator:
         # Register tools
         self._register_twitter_tool()
         self._register_intents_tool()
+        self._register_crypto_tool()
+        self._register_perplexity_tool()
+        self._register_time_tool()
+        self._register_weather_tool()
         
         # Log registered tools for debugging
         logger.info(f"Registered tools: {list(self.tools.keys())}")
@@ -144,9 +156,9 @@ class Orchestrator:
                 schedule_manager=self.schedule_manager
             )
 
-            # Register tool
+            # Register tool - consistently use registry.tool_type.value as the key
             self.tools[registry.tool_type.value] = tool
-            logger.info(f"Successfully registered TwitterTool")
+            logger.info(f"Successfully registered TwitterTool with key: {registry.tool_type.value}")
             
         except Exception as e:
             logger.error(f"Failed to register TwitterTool: {e}")
@@ -154,7 +166,7 @@ class Orchestrator:
 
     def register_tool(self, tool: BaseTool):
         """Enhanced tool registration"""
-        self.tools[tool.name] = tool
+        self.tools[tool.registry.tool_type.value] = tool
         
         # Use tool's registry directly for schedule manager registration
         if tool.registry.requires_scheduling:
@@ -367,7 +379,8 @@ class Orchestrator:
                     topic=command_analysis.get("topic"),
                     count=command_analysis["item_count"],
                     schedule_id=command_analysis.get("schedule_id"),
-                    tool_operation_id=str(operation['_id'])
+                    tool_operation_id=str(operation['_id']),
+                    analyzed_params=command_analysis  # Pass the full command analysis
                 )
                 
                 logger.info(f"Content generation completed for operation {operation['_id']}")
@@ -411,9 +424,10 @@ class Orchestrator:
                         },
                         **command_analysis  # Include analysis results
                     },
-                    content_updates={
-                        "items": generation_result["items"]  # Store generated items
-                    }
+                    # Conditionally update content only if items exist
+                    content_updates=({
+                        "items": generation_result["items"]
+                    } if "items" in generation_result else {})
                 )
                 
                 # Now determine next state based on requirements
@@ -431,25 +445,33 @@ class Orchestrator:
                         items=generation_result["items"]  # Pass the generated items
                     )
                 else:
-                    # Move to execution
-                    await self.tool_state_manager.update_operation(
+                    # One-shot tool - move to execution immediately
+                    logger.info(f"Executing one-shot tool operation {operation['_id']} immediately")
+
+                    # >>> ADD THIS CALL TO FINALIZE THE OPERATION <<< 
+                    await self.tool_state_manager.end_operation(
                         session_id=session_id,
                         tool_operation_id=str(operation['_id']),
-                        state=ToolOperationState.EXECUTING.value
+                        success=True,
+                        api_response=generation_result.get("data", {}), # Store raw data if available
+                        step="completed"
                     )
-                    
-                    if tool.registry.requires_scheduling:
-                        return await self._handle_scheduled_operation(operation, generation_result["items"])
-                    else:
-                        # Execute immediately
-                        result = await tool.run(message)
-                        await self.tool_state_manager.end_operation(
-                            session_id=session_id,
-                            tool_operation_id=str(operation['_id']),
-                            success=True,
-                            api_response=result
-                        )
-                        return result
+                    # >>> END OF ADDED CALL <<<
+
+                    # Return the result directly
+                    return {
+                        "status": "completed",
+                        "state": ToolOperationState.COMPLETED.value,
+                        "requires_chat_response": True,
+                        "response": generation_result.get("response", ""),
+                        "data": generation_result,
+                        "operation_summary": {
+                            "summary": f"Completed {tool.name} operation successfully",
+                            "operation_id": str(operation['_id']),
+                            "execution_type": "immediate",
+                            "raw_data": generation_result
+                        }
+                    }
 
             except Exception as e:
                 logger.error(f"Error processing tool operation: {e}")
@@ -489,7 +511,7 @@ class Orchestrator:
             
             # For ongoing operations
             return {
-                "response": result,
+                "response": generation_result.get("response", ""),
                 "status": "ongoing",
                 "state": operation.get("state") if operation else "unknown",
                 "tool_type": tool_type
@@ -691,7 +713,8 @@ class Orchestrator:
                             count=regenerate_count,
                             revision_instructions=revision_instructions,
                             schedule_id=operation.get('metadata', {}).get('schedule_id'),
-                            tool_operation_id=str(operation['_id'])
+                            tool_operation_id=str(operation['_id']),
+                            analyzed_params=operation.get('input_data', {})  # Pass original command analysis
                         )
                     
                     # Get the newly generated items
@@ -906,7 +929,7 @@ class Orchestrator:
                 near_account=self.near_account  # This is the critical injection
             )
 
-            # Register tool with the exact key that will be looked up
+            # Register tool - consistently use registry.tool_type.value as the key
             self.tools[registry.tool_type.value] = tool
             
             # Also register in schedule_manager's tool_registry for scheduled operations
@@ -990,3 +1013,123 @@ Format the summary to:
         except Exception as e:
             logger.error(f"Error in _handle_approved_operation: {e}")
             raise
+
+    def _register_crypto_tool(self):
+        """Register CryptoTool for crypto operations"""
+        try:
+            # Import CryptoTool here to avoid circular imports
+            from src.tools.crypto_data import CryptoTool
+            
+            # Get registry requirements from CryptoTool
+            registry = CryptoTool.registry
+
+            # Initialize tool with deps
+            tool = CryptoTool(deps=self.deps)
+            
+            # Inject required services
+            tool.inject_dependencies(
+                tool_state_manager=self.tool_state_manager,
+                llm_service=self.llm_service,
+                approval_manager=self.approval_manager,
+                schedule_manager=self.schedule_manager,
+                coingecko_client=self.coingecko_client
+            )
+
+            # Register tool - consistently use registry.tool_type.value as the key
+            self.tools[registry.tool_type.value] = tool
+            
+            # Also register in schedule_manager's tool_registry for scheduled operations
+            self.schedule_manager.tool_registry[registry.content_type.value] = tool
+            
+            logger.info(f"Successfully registered CryptoTool with key: {registry.tool_type.value}")
+            
+        except Exception as e:
+            logger.error(f"Failed to register CryptoTool: {e}")
+            logger.exception("CryptoTool registration failed with exception:")  # Log full traceback
+
+    def _register_perplexity_tool(self):
+        """Register PerplexityTool for search operations"""
+        try:
+            # Import PerplexityTool here to avoid circular imports
+            from src.tools.perplexity_search import PerplexityTool
+            
+            # Get registry requirements from PerplexityTool
+            registry = PerplexityTool.registry
+
+            # Initialize tool with deps
+            tool = PerplexityTool(deps=self.deps)
+            
+            # Inject required services
+            tool.inject_dependencies(
+                tool_state_manager=self.tool_state_manager,
+                llm_service=self.llm_service,
+                approval_manager=self.approval_manager,
+                schedule_manager=self.schedule_manager,
+                perplexity_client=self.perplexity_client
+            )
+
+            # Register tool - consistently use registry.tool_type.value as the key
+            self.tools[registry.tool_type.value] = tool
+            
+            # Also register in schedule_manager's tool_registry for scheduled operations
+            self.schedule_manager.tool_registry[registry.content_type.value] = tool
+            
+            logger.info(f"Successfully registered PerplexityTool with key: {registry.tool_type.value}")
+            
+        except Exception as e:
+            logger.error(f"Failed to register PerplexityTool: {e}")
+            logger.exception("PerplexityTool registration failed with exception:")  # Log full traceback
+
+    def _register_time_tool(self):
+        """Register TimeTool for time-related operations"""
+        try:
+            # Import TimeTool here to avoid circular imports
+            from src.tools.time_tools import TimeTool
+            
+            # Get registry requirements from TimeTool
+            registry = TimeTool.registry
+
+            # Initialize tool with deps
+            tool = TimeTool(deps=self.deps)
+            
+            # Inject required services
+            tool.inject_dependencies(
+                tool_state_manager=self.tool_state_manager,
+                llm_service=self.llm_service
+            )
+
+            # Register tool - consistently use registry.tool_type.value as the key
+            self.tools[registry.tool_type.value] = tool
+            
+            logger.info(f"Successfully registered TimeTool with key: {registry.tool_type.value}")
+            
+        except Exception as e:
+            logger.error(f"Failed to register TimeTool: {e}")
+            logger.exception("TimeTool registration failed with exception:")  # Log full traceback
+            
+    def _register_weather_tool(self):
+        """Register WeatherTool for weather-related operations"""
+        try:
+            # Import WeatherTool here to avoid circular imports
+            from src.tools.weather_tools import WeatherTool
+            
+            # Get registry requirements from WeatherTool
+            registry = WeatherTool.registry
+
+            # Initialize tool with deps
+            tool = WeatherTool(deps=self.deps)
+            
+            # Inject required services
+            tool.inject_dependencies(
+                tool_state_manager=self.tool_state_manager,
+                llm_service=self.llm_service
+            )
+
+            # Register tool - consistently use registry.tool_type.value as the key
+            self.tools[registry.tool_type.value] = tool
+            
+            logger.info(f"Successfully registered WeatherTool with key: {registry.tool_type.value}")
+            
+        except Exception as e:
+            logger.error(f"Failed to register WeatherTool: {e}")
+            logger.exception("WeatherTool registration failed with exception:")  # Log full traceback
